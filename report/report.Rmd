@@ -1,1 +1,340 @@
-<!-- Placeholder -->
+---
+title: "CSP-571 Project - Predicting Mushroom Edibility"
+author: "Liwei He"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+required_packages <- c(
+  "knitr",
+  "ggplot2",
+  "scales",
+  "rpart",
+  "rpart.plot",
+  "randomForest",
+  "pROC"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    paste(
+      "Install these packages before knitting:",
+      paste(missing_packages, collapse = ", ")
+    )
+  )
+}
+
+project_root <- normalizePath("..", winslash = "/", mustWork = TRUE)
+knitr::opts_knit$set(root.dir = project_root)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "90%"
+)
+```
+
+# 1. Project Goal
+
+Link to the dataset:
+
+Biology  
+Mushrooms: https://visualization.group/data/mushroom/
+
+I'm using the
+[UCI Secondary Mushroom Dataset](https://archive.ics.uci.edu/dataset/848/secondary+mushroom+dataset)
+to predict whether a simulated mushroom record is edible or poisonous. 
+
+I built and compared three models: logistic regression, a decision tree, and a random forest.
+
+# 2. Data Reading and Cleaning
+
+The raw file is semicolon-delimited and contains one target variable and 20 predictors.
+
+```{r load-data}
+RUN_QC <- FALSE
+RUN_PLOTS <- FALSE
+source("code/01_eda.R")
+
+data_summary <- data.frame(
+  Item = c(
+    "Raw rows",
+    "Columns",
+    "Numerical predictors",
+    "Categorical predictors"
+  ),
+  Value = c(
+    nrow(mushrooms),
+    ncol(mushrooms),
+    length(numeric_variables),
+    length(categorical_variables)
+  )
+)
+
+knitr::kable(data_summary, caption = "Data overview")
+```
+
+9 categorical predictors have missing values, some quite heavily. 
+Rather than dropping those rows, I recoded missing entries as an explicit `unknown`
+level, and removed 146 exact duplicate rows before splitting the data.
+
+```{r cleaning-summary}
+knitr::kable(
+  cleaning_summary,
+  col.names = c("Cleaning check", "Value"),
+  caption = "Cleaning results"
+)
+```
+
+The final modeling dataset contains 60,923 rows, no missing values, and no exact
+duplicates.
+
+# 3. Exploratory Data Analysis
+
+## Class distribution
+
+```{r class-plot, fig.height=5}
+eda_plots$class_distribution
+```
+
+The classes are close to balanced - 44.6% edible, 55.4% poisonous - so
+accuracy is a reasonable metric here. I also track poisonous-class recall,
+since calling a poisonous mushroom "edible" is the costlier mistake.
+
+## Missing values
+
+```{r missing-plot, fig.height=6}
+eda_plots$missing_values
+```
+
+A handful of variables are missing more than 80% of their values, which ruled
+out dropping incomplete rows. I kept them and coded missing entries as their
+own `unknown` level - if missingness itself correlates with edibility, the
+model can use that signal instead of losing it.
+
+## Numerical predictors
+
+```{r numeric-plot, fig.width=11, fig.height=5}
+eda_plots$numeric_boxplots
+```
+
+Edible mushrooms tend to run a bit larger - bigger cap diameter, taller and
+wider stems, though all three measurements have long right tails. I left
+those outliers in; they're part of the simulated data as generated.
+
+## Selected categorical predictors
+
+```{r categorical-plot, fig.height=10}
+eda_plots$categorical_class_proportions
+```
+
+I selected `cap_shape`, `gill_attachment`, and `habitat` for this plot -
+together they cover cap morphology, gill structure, and growing environment,
+and their levels show visibly different class proportions. A few habitat
+categories are entirely one class, but those are also the smallest groups.
+Most common levels still contain a mix of both classes, which is the point of
+combining several predictors in a model.
+
+# 4. Train/Test Split
+
+I use `set.seed(571)` and an 80/20 stratified split. All three models are
+evaluated on the same held-out test set.
+
+```{r run-models, results='hide'}
+RUN_QC <- FALSE
+RUN_PLOTS <- FALSE
+RUN_MODEL_PLOTS <- FALSE
+source("code/02_modeling.R")
+```
+
+```{r split-table}
+knitr::kable(split_summary, caption = "Stratified data split")
+```
+
+The class proportions are nearly identical across the training and test sets.
+
+# 5. Logistic Regression
+
+The logistic model provides a linear baseline. Numerical predictors are
+standardized using training-set statistics only.
+
+```{r logistic-results}
+knitr::kable(
+  as.data.frame.matrix(logistic_results$confusion_matrix),
+  caption = "Logistic regression confusion matrix"
+)
+```
+
+Logistic regression is the weakest of the three, with 848 dangerous false
+negatives. R also warns that some fitted probabilities are numerically 0 or
+1, a sign the classes are close to perfectly separable on some combination of
+predictors - logistic regression just isn't flexible enough to find that
+boundary. I use it mainly as a baseline rather than digging into individual
+coefficients.
+
+# 6. Decision Tree
+
+```{r tree-results}
+knitr::kable(
+  as.data.frame.matrix(tree_results$confusion_matrix),
+  caption = "Decision tree confusion matrix"
+)
+```
+
+The full tree does much better - 98.91% test accuracy, 60 dangerous false
+negatives. It's too large to plot legibly, so the figure below is a pruned
+version showing the top few splits; the reported numbers still come from the
+full tree.
+
+```{r tree-plot, fig.width=11, fig.height=7}
+display_candidates <- tree_model$cptable[
+  tree_model$cptable[, "nsplit"] <= 6,
+  ,
+  drop = FALSE
+]
+
+display_cp <- display_candidates[nrow(display_candidates), "CP"]
+display_tree <- rpart::prune(tree_model, cp = display_cp)
+
+rpart.plot::rpart.plot(
+  display_tree,
+  type = 2,
+  extra = 104,
+  fallen.leaves = TRUE,
+  tweak = 0.9,
+  main = "Simplified Decision Tree"
+)
+```
+
+Stem width is the first split, then cap color, then stem root. It's a clean
+illustration of how a tree turns classification into readable if/then rules
+- though these specific thresholds are fit to one simulated dataset, not
+mycological fact.
+
+# 7. Random Forest
+
+The random forest combines 300 trees and provides an out-of-bag error estimate.
+
+```{r forest-results}
+knitr::kable(
+  as.data.frame.matrix(random_forest_results$confusion_matrix),
+  caption = "Random forest confusion matrix"
+)
+
+oob_result <- data.frame(
+  Measure = "OOB error",
+  Value = round(as.numeric(random_forest_oob_error), 6)
+)
+
+knitr::kable(oob_result, caption = "Random forest OOB result")
+```
+
+The random forest gets every test record right, with zero OOB error. This
+matches the dataset's original paper, so it's not a bug on my end - the
+simulated data is just that separable. It's a strong result on this
+benchmark, not proof the model would generalize to a real, unseen species.
+
+```{r importance-plot, fig.width=9, fig.height=7}
+randomForest::varImpPlot(
+  random_forest_model,
+  type = 1,
+  n.var = 15,
+  main = "Random Forest Variable Importance"
+)
+```
+
+```{r numeric-correlation-check}
+correlation_check <- data.frame(
+  Comparison = c(
+    "stem_width vs. cap_diameter",
+    "stem_width vs. stem_height"
+  ),
+  Pearson = c(
+    cor(mushrooms_clean$stem_width, mushrooms_clean$cap_diameter, method = "pearson"),
+    cor(mushrooms_clean$stem_width, mushrooms_clean$stem_height, method = "pearson")
+  ),
+  Spearman = c(
+    cor(mushrooms_clean$stem_width, mushrooms_clean$cap_diameter, method = "spearman"),
+    cor(mushrooms_clean$stem_width, mushrooms_clean$stem_height, method = "spearman")
+  )
+)
+
+knitr::kable(
+  correlation_check,
+  digits = 3,
+  caption = "Correlation check for numerical size predictors"
+)
+```
+
+`cap_surface`, `gill_attachment`, `cap_color`, and `gill_color` top the
+random forest's permutation-importance ranking. `stem_width` - the first
+split in the simplified tree - ranks around 11th. That's not a contradiction:
+a single tree picks the locally best one-step split, while permutation
+importance measures the accuracy drop from shuffling a variable across the
+whole forest. The correlation check shows why: `stem_width` overlaps heavily
+with `cap_diameter` (r = 0.695, Spearman = 0.863), more than with
+`stem_height`. Once `cap_diameter` is available, shuffling `stem_width`
+doesn't cost the forest much - it can recover similar information elsewhere.
+The ranking reflects each variable's marginal contribution within this
+forest, not a causal claim about what makes a mushroom poisonous.
+
+# 8. Model Comparison and Conclusion
+
+```{r comparison-table}
+comparison_table <- model_comparison
+
+percentage_columns <- c(
+  "Accuracy",
+  "Poisonous_Recall",
+  "Specificity",
+  "Precision",
+  "F1"
+)
+
+comparison_table[percentage_columns] <- lapply(
+  comparison_table[percentage_columns],
+  scales::percent,
+  accuracy = 0.01
+)
+
+knitr::kable(
+  comparison_table,
+  caption = "Held-out test-set model comparison"
+)
+```
+
+Random forest wins outright - perfect metrics, zero dangerous false
+negatives. The decision tree is close behind at 98.91% accuracy and has one
+real advantage: you can explain the rule to someone. Logistic regression
+trails both by a wide margin, which suggests the edible/poisonous boundary
+here isn't linear. 
+There's enough interaction between stem dimensions, color and surface texture, that a straight-line model can't capture it.
+
+I will go with the random forest: the cost of a false negative is too high to
+trade away for interpretability. The decision tree as the easy-to-explain version, since a 1-2% accuracy gap is okay for something you can actually walk someone through.
+
+One caveat on the perfect random forest score: all 61,069 records come from
+the same simulation process built on only 173 real species, so a random
+train/test split isn't really testing on an unseen species - it's closer to
+testing on a held-out sample from the same distribution. A species-aware
+split would be a tougher, more realistic test. I didn't have time to build
+that here, but it's the first thing I'd try next, along with checking how
+much accuracy holds up using just the top 3-4 features.
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+**AI Assistance Note**
+
+The explanation of why `stem_width` was the top split in the pruned decision
+tree but ranked around 11th in the random forest's permutation importance
+came out of a discussion with Claude (Sonnet 5). 

@@ -1,6 +1,7 @@
-# CSP-571 Group 6
-# Mushroom Classification Project
-
+# Classification Project
+# CSP-571 
+# Biology: Mushrooms
+## Group 6: 
 ## Group Member
 - Liwei He 
 
